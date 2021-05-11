@@ -1,0 +1,414 @@
+---
+title: "Website Quality Analysis"
+author: "Jian Jian"
+date: "6/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Environment Setup
+
+Presetup
+
+```{r tobit}
+# Give the input file name to the function.
+set.seed(77)
+raw_data <- read.csv("data/untrunc_data_cleaned.csv")
+# names(raw_data)[names(raw_data) == "in."] <- "in"
+`%notin%` <- Negate(`%in%`)
+# raw_data <- raw_data[which(colnames(raw_data) %notin% c("first_appear", "avg_year", "min_year", "max_year"))]
+# raw_data$label <- log(raw_data$label)
+summary(raw_data)
+```
+Split the data
+
+```{r}
+require('ggplot2')
+require(tidyverse)
+require(caret)
+require(psycho)
+ll <- -Inf
+ul <- 2020 - 1990
+
+split=0.70
+# raw_data$label <- psycho::standardize(raw_data$label)
+
+train_idx <- createDataPartition(raw_data$label, p=split, list=FALSE)
+train_data <- slice(raw_data, train_idx)
+test_data <- slice(raw_data, -train_idx)
+
+# Resampling
+# train_data_idx_censored <- which(train_data$label == ll | train_data$label == ul)
+# train_data_idx_uncensored <- which(train_data$label > ll & train_data$label < ul)
+# train_data_idx_uncensored_resampled <- sample(train_data_idx_uncensored, size=length(train_data_idx_censored), replace = TRUE)
+# 
+# train_data <- slice(train_data, append(train_data_idx_censored, train_data_idx_uncensored_resampled))
+
+```
+## Training
+
+Tobit Regression uses the log likeihood ratio to estimate the case when actual y value exceeded the value presented in the dataset.
+
+```{r training, echo=FALSE}
+require("AER")
+library('broom')
+filte_formular_features <- function(df, label_name) {
+  removing_columns <- c(label_name, "X")
+  for (col_name in removing_columns) {
+    if(col_name %in% colnames(df)) {
+      df <- select(df, -col_name)
+    }
+  }
+
+  return (df)
+}
+label_name <- "label"
+c_name <- colnames(filte_formular_features(raw_data, label_name))
+
+fn <- as.formula(paste(label_name, paste(c_name, collapse = " + "), sep = " ~ "))
+
+
+```
+
+
+```{r statistic_score, echo=FALSE}
+get_log_likelihood <- function(model, check_data, ul, features) {
+
+  # https://stats.stackexchange.com/questions/290833/likelihood-function-for-tobit
+  sigma <- model$scale
+  I <- check_data$label
+  X <- filte_formular_features(check_data, label_name)
+  X <- select(X, features)
+  X <- cbind(1,as.matrix(X))
+  Y <- check_data$label
+  b <- coef(model)
+  xb <- X %*% b
+
+  # The uncensored records are those rows scraped from waybackmachine with label 0
+  uncensored <- sum(log(dnorm(((Y[which(I>ll & I <ul)] - xb[which(I>ll & I <ul)])/ sigma), mean = 0, sd = 1)) - log(sigma))
+
+  # The alive resources are considered to be censored. They are labeled as 1
+  # Only right censored term applied for our case
+  ll_censored <- sum(log(1-pnorm((xb[which(I<=ll)]) / sigma, mean = 0, sd = 1)))
+  ul_censored <- sum(log(1-pnorm((ul - xb[which(I>=ul)]) / sigma, mean = 0, sd = 1)))
+
+
+  return(ll_censored + uncensored + ul_censored)
+}
+
+get_pseudo_r2 <- function(model, check_data, features) {
+  perf <-list()
+  perf$y <- check_data$label
+  perf$yhat <- predict(model, newdata = select(check_data, features))
+  # perf$yhat[which(perf$yhat > ul)] <- ul
+  return(with(perf, cor(yhat, y)) ^ 2)
+}
+
+get_aic <- function(model, log_L) {
+  k <- length(summary(model)$coefficients[,1])
+  return (2 * k - 2 * log_L)
+}
+
+test_chi_square <- function(model, check_data, features) {
+  residual <- check_data$label
+  residual <- residual - predict(model, newdata = select(check_data, features))
+  residual_square <- residual ^ 2
+  return (chisq.test(residual_square))
+}
+
+plot_importance <- function(model) {
+  imp <- as.matrix(summary(model)$coefficients[,1:4])
+  imp <- data.frame(name=rownames(imp), coef=imp[,1], p_value=imp[,4])
+  imp <- imp[2:(nrow(imp)-1),]
+  
+  ggplot(imp, aes(x=coef, y=reorder(name,coef), fill = p_value)) +
+    geom_bar(stat="identity")
+}
+
+plot_residual_hist <- function(model, check_data, features) {
+  residual <- as.matrix(predict(model, newdata = select(check_data, features)))[,1]
+  residual[residual > ul] <- ul
+  residual <- check_data$label - residual
+  
+  residual <- residual ^ 2
+  residual <- data.frame(residual=residual)
+  ggplot(residual, aes(x=residual)) + 
+    geom_histogram(aes(y = ..density..), bins=20) + 
+    geom_density()
+}
+
+plot_performance <- function(model, check_data, features) {
+  pseudo_r2 <- get_pseudo_r2(model, check_data, features)
+  log_lik <- get_log_likelihood(model, check_data, ul, features)
+  chi_square_test <- test_chi_square(model, test_data, features)
+  aic <- get_aic(model, log_lik)
+  
+  print('---')
+  print(summary(model))
+  print('---')
+  print(paste('Pseudo R square: ', pseudo_r2))
+  print('---')
+  print(paste('Log likelihood: ', log_lik))
+  print('---')
+  print(paste('AIC: ', aic))
+  print('---')
+  print(chi_square_test)
+
+  plot_residual_hist(model, check_data, features)
+  
+  plot_importance(model)
+}
+
+
+k <- 10
+left <- ll
+right <- ul
+tobit_distribution <- "gaussian"
+# tobit_distribution <- "exponential"
+# tobit_distribution <- "loggaussian"
+# tobit_distribution <- "loglogistic"
+```
+
+```{r k_folod_val, echo=FALSE}
+
+# Full features
+test_record <- train_data
+features <- c_name[c_name != 'first_appear']
+
+# Training
+fn <- as.formula(paste(label_name, paste(features, collapse = " + "), sep = " ~ "))
+
+best_model <- NULL
+best_log_likelihood <- -Inf
+folds <- createFolds(test_record[,1], k = k)
+for (i in 1:length(folds)) {
+  model <- AER::tobit(fn, left = left, right = right, dist = tobit_distribution, subset = NULL, data = test_record[-folds[[i]],])
+  log_likelihood <- get_log_likelihood(model, test_record[folds[[i]],], ul, features)
+  if (log_likelihood > best_log_likelihood) {
+    best_log_likelihood <- log_likelihood
+    best_model <- model
+  }
+}
+
+# summary(censReg::censReg(fn, left = left, right = right, data = raw_data))
+
+
+plot_performance(best_model, test_data, features)
+
+```
+
+
+```{r k_folod_val, echo=FALSE}
+
+# Full features
+test_record <- train_data
+features <- c_name[c_name %notin% c('first_appear', 'avg_year', 'max_year')]
+
+# Training
+fn <- as.formula(paste(label_name, paste(features, collapse = " + "), sep = " ~ "))
+
+best_model <- NULL
+best_log_likelihood <- -Inf
+folds <- createFolds(test_record[,1], k = k)
+for (i in 1:length(folds)) {
+  model <- AER::tobit(fn, left = left, right = right, dist = tobit_distribution, subset = NULL, data = test_record[-folds[[i]],])
+  log_likelihood <- get_log_likelihood(model, test_record[folds[[i]],], ul, features)
+  if (log_likelihood > best_log_likelihood) {
+    best_log_likelihood <- log_likelihood
+    best_model <- model
+  }
+}
+
+plot_performance(best_model, test_data, features)
+
+```
+
+
+```{r k_folod_val, echo=FALSE}
+# Lasso features - untruncated
+lasso_features <- c(
+  "protocol_type",
+  "total_num_of_paper_citing",
+  "num_of_author_citing",
+  "title_length",
+  "has_www",
+  "max_year",
+  "url_depth",
+  "hyperlink_cnt",
+  "param_cnt",
+  "subdomain_level",
+  "total_num_of_journal_self_citation",
+  "avg_year",
+  "charset",
+  "external_js_cnt",
+  "avg_mid_author_hindex",
+  "internal_js_cnt",
+  "num_of_journal_citing",
+  "org",
+  "num_of_affiliation_citing",
+  "has_iframe"
+)
+lasso_train_data <- select(train_data, c(lasso_features, label_name))
+lasso_test_data <- select(test_data, c(lasso_features, label_name))
+test_record <- lasso_train_data
+features <- lasso_features
+
+# Training
+fn <- as.formula(paste(label_name, paste(features, collapse = " + "), sep = " ~ "))
+
+best_model <- NULL
+best_log_likelihood <- -Inf
+set.seed(77)
+folds <- createFolds(test_record[,1], k = k)
+for (i in 1:length(folds)) {
+  model <- AER::tobit(fn, left = left, right = right, dist = tobit_distribution, subset = NULL, data = test_record[-folds[[i]],])
+  log_likelihood <- get_log_likelihood(model, test_record[folds[[i]],], ul, features)
+  if (log_likelihood > best_log_likelihood) {
+    best_log_likelihood <- log_likelihood
+    best_model <- model
+  }
+}
+
+untruncated_model <- best_model
+plot_performance(best_model, test_data, features)
+
+```
+
+
+```{r k_folod_val, echo=FALSE}
+# Lasso features - truncated
+lasso_features <- c(
+  "protocol_type",
+  "gov",
+  "total_num_of_paper_citing",
+  "num_of_author_citing",
+  "total_num_of_journal_self_citation",
+  "total_num_of_author_self_citation",
+  "avg_mid_author_hindex",
+  "external_js_cnt",
+  "charset",
+  "num_of_affiliation_citing",
+  "url_depth",
+  "num_of_journal_citing"
+)
+
+lasso_train_data <- select(train_data, c(lasso_features, label_name))
+lasso_test_data <- select(test_data, c(lasso_features, label_name))
+test_record <- lasso_train_data
+features <- lasso_features
+
+# Training
+fn <- as.formula(paste(label_name, paste(features, collapse = " + "), sep = " ~ "))
+
+best_model <- NULL
+best_log_likelihood <- -Inf
+set.seed(77)
+folds <- createFolds(test_record[,1], k = k)
+for (i in 1:length(folds)) {
+  model <- AER::tobit(fn, left = left, right = right, dist = tobit_distribution, subset = NULL, data = test_record[-folds[[i]],])
+  log_likelihood <- get_log_likelihood(model, test_record[folds[[i]],], ul, features)
+  if (log_likelihood > best_log_likelihood) {
+    best_log_likelihood <- log_likelihood
+    best_model <- model
+  }
+}
+
+plot_performance(best_model, test_data, features)
+
+```
+
+
+```{r plot important, echo=FALSE}
+
+check_data <- train_data
+check_data <- test_data
+# Experimentap area
+# Train model
+# model <- AER::tobit(fn, left = left, right = right, dist = tobit_distribution, subset = NULL, data = check_data)
+
+# Predict
+res <- predict(untruncated_model, check_data)
+
+perf <-list()
+perf$y <- check_data$label
+perf$yhat <- res
+# perf$yhat[which(perf$yhat > ul)] <- ul
+
+format(with(perf, cor(yhat, y)) ^ 2, digits = 4, scientific = FALSE)
+
+lifespan <- perf$yhat + 1990 - check_data$first_appear
+lifespan <- lifespan[!is.na(lifespan)]
+lifespan <- data.frame(lifespan=lifespan)
+
+ggplot(lifespan, aes(x=lifespan)) + 
+    geom_histogram(aes(y = ..density..), bins=20) + 
+    geom_density() + 
+    geom_vline(xintercept=median(lifespan$lifespan), colour="red") + 
+    geom_text(aes(x=median(lifespan), label=median(lifespan), y=-.005))
+```
+
+
+```{r}
+get_log_likelihood <- function(model, check_data, ul, features) {
+
+  # https://stats.stackexchange.com/questions/290833/likelihood-function-for-tobit
+  sigma <- model$scale
+  I <- check_data$label
+  X <- filte_formular_features(check_data, label_name)
+  X <- select(X, features)
+  X <- cbind(1,as.matrix(X))
+  Y <- check_data$label
+  b <- coef(model)
+  xb <- X %*% b
+
+  # The uncensored records are those rows scraped from waybackmachine with label 0
+  uncensored <- sum(log(dnorm(((Y[which(I>ll & I <ul)] - xb[which(I>ll & I <ul)])/ sigma), mean = 0, sd = 1)) - log(sigma))
+
+  # The alive resources are considered to be censored. They are labeled as 1
+  # Only right censored term applied for our case
+  ll_censored <- sum(log(1-pnorm((xb[which(I<=ll)]) / sigma, mean = 0, sd = 1)))
+  ul_censored <- sum(log(1-pnorm((ul - xb[which(I>=ul)]) / sigma, mean = 0, sd = 1)))
+
+
+  return(ll_censored + uncensored + ul_censored)
+}
+
+
+model <- AER::tobit(fn, left = left, right = right, dist = tobit_distribution, scale = F, data = raw_data)
+log_lik <- get_log_likelihood(model, raw_data, ul, features)
+print(paste('scale:', model$scale))
+print(paste('log_lik: ', log_lik))
+logLik(model)
+coef(model,logSigma = FALSE)
+
+cat(as.vector(coef(model)), sep='\n')
+
+var(raw_data$label)
+
+sd(raw_data$label[which(raw_data$label>ll & raw_data$label <ul)] - predict(model, raw_data$label[which(raw_data$label>ll & raw_data$label <ul)]))
+
+sd(raw_data$label)
+m <- lm(fn, data = raw_data)
+sd(m$residuals)
+
+predict(model, raw_data, type = "scale")
+
+sqrt(sum((predict(model, raw_data) - raw_data$label) ** 2/ dim(raw_data)[1]))
+sd(raw_data$label[which(raw_data$label<=ll | raw_data$label >= ul)])
+
+(predict(model, raw_data)[1] - raw_data$label[1]) ** 2
+
+
+(raw_data$label - predict(model, raw_data)) [1]
+sqrt(sum(resid(model) ** 2) / dim(raw_data)[1])
+
+
+
+help("survreg")
+
+install.packages('Metrics')
+rmse(raw_data$label, predict(model, raw_data))
+```

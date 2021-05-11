@@ -1,0 +1,81 @@
+---
+title: "test"
+author: "Jian Jian"
+date: "6/30/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+raw_data <- read.csv("~/Desktop/wq.csv")
+# raw_data <- raw_data[which(colnames(raw_data) != "label")]
+#df <- read.csv("~/Desktop/tobit.csv")
+summary(raw_data)
+```
+
+Split the data
+
+```{r}
+require(tidyverse)
+require(caret)
+
+split=0.70
+train_idx <- createDataPartition(raw_data$last_available_timestamp, p=split, list=FALSE)
+train_data <- raw_data %>%
+  slice(train_idx)
+test_data <- raw_data %>%
+  slice(-train_idx)
+
+X_train <- train_data %>% 
+  select(-last_available_timestamp)
+X_test <- test_data %>% 
+  select(-last_available_timestamp)
+
+y_train <- train_data %>% 
+  select(last_available_timestamp)
+y_test <- test_data %>% 
+  select(last_available_timestamp)
+```
+
+
+K-Fold
+
+```{r}
+folds <- createFolds(X_train$protocol_type, k = 10)
+```
+
+
+```{r pressure, echo=FALSE}
+require("AER")
+
+label_name <- "last_available_timestamp"
+c_name <- colnames(raw_data)
+c_name <- c_name[which(c_name != label_name)]
+fn <- last_available_timestamp ~ protocol_type + has_www + has_iframe + 
+    int + org + gov + in. + eu + cn + url_depth + subdomain_level + 
+    param_cnt + title_length + internal_js_cnt + external_js_cnt + 
+    charset + hyperlink_cnt + total_num_of_paper_citing + total_num_of_author_citing + 
+    total_num_of_affiliation_citing + total_num_of_journal_citing + 
+    total_num_of_author_self_citation + total_num_of_affiliation_self_citation + 
+    total_num_of_journal_self_citation + avg_year + min_year + 
+    max_year + median + num_of_author + num_of_author_citing + 
+    num_of_affiliation_citing + num_of_journal_citing + avg_hindex + 
+    first_author_hindex + avg_mid_author_hindex +
+    # first_author_hindex + last_author_hindex + avg_mid_author_hindex +
+    paper_unique_affiliation + first_appear
+
+ul <- max(raw_data[label_name])
+
+model <- tobit(fn, left = 0, right = ul, dist = "gaussian", subset = NULL, data = train_data)
+summary(model)
+as.matrix(predict(model, train_data, type="response"))
+```

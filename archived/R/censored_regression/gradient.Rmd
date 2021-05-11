@@ -1,0 +1,333 @@
+---
+title: "Website Quality Analysis"
+author: "Jian Jian"
+date: "6/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Environment Setup
+
+Presetup
+
+```{r tobit}
+# Give the input file name to the function.
+set.seed(77)
+raw_data <- read.csv("data/untrunc_data_cleaned.csv")
+`%notin%` <- Negate(`%in%`)
+# raw_data <- raw_data[which(colnames(raw_data) %notin% c("first_appear", "avg_year", "min_year", "max_year"))]
+# raw_data$label <- log(raw_data$label)
+summary(raw_data)
+```
+Split the data
+
+```{r}
+require('ggplot2')
+require(tidyverse)
+require(caret)
+ll <- 1
+ul <- 2020 - 1990
+
+split=0.70
+train_idx <- createDataPartition(raw_data$label, p=split, list=FALSE)
+train_data <- slice(raw_data, train_idx)
+test_data <- slice(raw_data, -train_idx)
+
+# Resampling
+# train_data_idx_censored <- which(train_data$label == ll | train_data$label == ul)
+# train_data_idx_uncensored <- which(train_data$label > ll & train_data$label < ul)
+# train_data_idx_uncensored_resampled <- sample(train_data_idx_uncensored, size=length(train_data_idx_censored), replace = TRUE)
+# 
+# train_data <- slice(train_data, append(train_data_idx_censored, train_data_idx_uncensored_resampled))
+
+```
+## Training
+
+Tobit Regression uses the log likeihood ratio to estimate the case when actual y value exceeds the value presented in the dataset.
+
+```{r training, echo=FALSE}
+require("AER")
+library('broom')
+filte_formular_features <- function(df, label_name) {
+  removing_columns <- c(label_name, "X")
+  for (col_name in removing_columns) {
+    if(col_name %in% colnames(df)) {
+      df <- select(df, -col_name)
+    }
+  }
+
+  return (df)
+}
+label_name <- "label"
+c_name <- colnames(filte_formular_features(raw_data, label_name))
+
+fn <- as.formula(paste(label_name, paste(c_name, collapse = " + "), sep = " ~ "))
+
+```
+
+
+```{r statistic_score, echo=FALSE}
+get_log_likelihood <- function(b, sigma, check_data, ul, features) {
+
+  # https://stats.stackexchange.com/questions/290833/likelihood-function-for-tobit
+  e <- 0.0000001
+  I <- check_data$label
+  X <- filte_formular_features(check_data, label_name)
+  X <- select(X, features)
+  X <- cbind(1,as.matrix(X))
+  Y <- check_data$label
+  xb <- X %*% b
+
+  # The uncensored records are those rows scraped from waybackmachine with label 0
+  uncensored <- sum(log(e + dnorm(((Y[which(I>ll & I <ul)] - xb[which(I>ll & I <ul)])/ sigma), mean = 0, sd = 1)) - log(sigma))
+  
+  # The alive resources are considered to be censored. They are labeled as 1
+  # Only right censored term applied for our case
+  ll_censored <- sum(log(e + 1-pnorm((xb[which(I<=ll)]) / sigma, mean = 0, sd = 1)))
+  ul_censored <- sum(log(e + 1-pnorm((ul - xb[which(I>=ul)]) / sigma, mean = 0, sd = 1)))
+
+
+  return (ll_censored + uncensored + ul_censored)
+}
+
+get_pseudo_r2 <- function(model, check_data, features) {
+  perf <-list()
+  perf$y <- check_data$label
+  perf$yhat <- predict(model, newdata = select(check_data, features))
+  # perf$yhat[which(perf$yhat > ul)] <- ul
+  return (with(perf, cor(yhat, y)) ^ 2)
+}
+
+get_aic <- function(model, log_L) {
+  k <- length(summary(model)$coefficients[,1])
+  return (2 * k - 2 * log_L)
+}
+
+test_chi_square <- function(model, check_data, features) {
+  residual <- check_data$label
+  residual <- residual - predict(model, newdata = select(check_data, features))
+  residual_square <- residual ^ 2
+  return (chisq.test(residual_square))
+}
+
+plot_importance <- function(model) {
+  imp <- as.matrix(summary(model)$coefficients[,1:4])
+  imp <- data.frame(name=rownames(imp), coef=imp[,1], p_value=imp[,4])
+  imp <- imp[2:(nrow(imp)-1),]
+  
+  ggplot(imp, aes(x=coef, y=reorder(name,coef), fill = p_value)) +
+    geom_bar(stat="identity")
+}
+
+plot_residual_hist <- function(model, check_data, features) {
+  residual <- as.matrix(predict(model, newdata = select(check_data, features)))[,1]
+  residual[residual > ul] <- ul
+  residual <- check_data$label - residual
+  
+  residual <- residual ^ 2
+  residual <- data.frame(residual=residual)
+  ggplot(residual, aes(x=residual)) + 
+    geom_histogram(aes(y = ..density..), bins=20) + 
+    geom_density()
+}
+
+plot_performance <- function(model, check_data, features) {
+  pseudo_r2 <- get_pseudo_r2(model, check_data, features)
+  log_lik <- get_log_likelihood(coef(model), model$scale, check_data, ul, features)
+  chi_square_test <- test_chi_square(model, test_data, features)
+  aic <- get_aic(model, log_lik)
+  
+  print('---')
+  print(summary(model))
+  print('---')
+  print(paste('Pseudo R square: ', pseudo_r2))
+  print('---')
+  print(paste('Log likelihood: ', log_lik))
+  print('---')
+  print(paste('AIC: ', aic))
+  print('---')
+  print(chi_square_test)
+
+  plot_residual_hist(model, check_data, features)
+  
+  plot_importance(model)
+}
+
+
+k <- 10
+left <- ll
+right <- ul
+```
+
+
+```{r}
+
+
+
+gradient_descent_tobit <- function(
+  # handling infinite issue for cdf
+  train_data, label_name, feature_names,
+  left, right,
+  b, sigma, 
+  regParam, elasticNetParam
+) {
+  e <- 0.0000001
+  left_idx <- which(train_data$label <= left)
+  right_idx <- which(train_data$label >= right)
+  mid_idx <- which(train_data$label > left & train_data$label < right)
+  train_data <- select(train_data, c(feature_names, label_name))
+  b_left <- 0
+  log_sigma_left <- 0
+  if (length(left_idx) > 0) {
+    train_data_left <- select(train_data[left_idx,], feature_names)
+    train_data_left <- cbind(1, train_data_left)
+    train_data_left <- as.matrix(train_data_left)
+    xb_left <- train_data_left %*% b
+    z_left <- (left - xb_left)/sigma
+    cdf_left <- pnorm(z_left)
+    pdf_left <- dnorm(z_left)
+    density_left <- (pdf_left / (cdf_left + e))
+    b_left <- density_left %*% train_data_left / sigma
+    log_sigma_left <- density_left %*% (left - xb_left) / sigma
+    log_sigma_left <- log_sigma_left[1]
+  }
+
+  b_right <- 0
+  log_sigma_right <- 0
+  if (length(right_idx) > 0) {
+    train_data_right <- select(train_data[right_idx,], feature_names)
+    train_data_right <- cbind(1, train_data_right)
+    train_data_right <- as.matrix(train_data_right)
+    xb_right <- train_data_right %*% b
+    z_right <- (xb_right -right)/sigma
+    cdf_right <- pnorm(z_right)
+    pdf_right <- dnorm(z_right)
+    density_right <- t(pdf_right / (cdf_right + e))
+    b_right <- density_right %*% train_data_right / sigma
+    log_sigma_right <- density_right %*% (xb_right - right) / sigma
+    log_sigma_right <- log_sigma_right[1]
+  }
+
+  train_data_mid <- select(train_data[mid_idx,], feature_names)
+  train_data_mid <- cbind(1, train_data_mid)
+  train_data_mid <- as.matrix(train_data_mid)
+  y_mid <- as.matrix(train_data[mid_idx,]$label)
+
+  xb_mid <- train_data_mid %*% b
+  z_mid <- (y_mid - xb_mid) / sigma
+  b_mid <- t(z_mid) %*%  train_data_mid / sigma
+  log_sigma_mid <- z_mid ** 2 -1
+  log_sigma_mid <- log_sigma_mid[1]
+
+  l1 <- sign(b)
+  l2 <- b
+  elasticNet <- regParam * (elasticNetParam * l1 + (1 - elasticNetParam) * l2)
+  elasticNet <- as.matrix(elasticNet)
+  # elasticNet <- rbind(0, elasticNet)
+  elasticNet <- t(elasticNet)
+
+  gradient_b <- b_left + b_mid + b_right - elasticNet
+  gradient_log_sigma <- log_sigma_left + log_sigma_mid + log_sigma_right
+  return (list(gradient_b, gradient_log_sigma))
+}
+
+
+train_tobit <- function(
+  train_data, test_data,
+  k_fold,
+  label_name, feature_names,
+  regParam, elasticNetParam, maxIter, learningRate,
+  leftCensorPoint, rightCensorPoint
+) {
+  train_data <- na.omit(train_data)
+  test_data <- na.omit(test_data)
+  train_data_uncensored_idx <- which(train_data$label > ll & train_data$label < ul)
+  train_data_ols <- slice(train_data, train_data_uncensored_idx)
+  # train_data_ols <- train_data
+  fn <- as.formula(paste(label_name, paste(feature_names, collapse = " + "), sep = " ~ "))
+  model_lm <- lm(fn, data = train_data_ols)
+  # Sigma is the sd of the residual, and it is said to be observable only on the uncensored records.
+  sigma <- model_lm %>% resid() %>% sd() / sqrt(dim(train_data_ols)[1])
+  b <- as.matrix(coef(model_lm))
+
+  best_model <- NULL
+  best_log_likelihood <- -Inf
+  folds <- createFolds(train_data_ols[,1], k = k_fold)
+  for (i in 1:length(folds)) {
+    b_gradient <- b
+    result <- NULL
+    for (j in 1 : maxIter) {
+      result <- gradient_descent_tobit(
+        train_data, label_name, feature_names,
+        leftCensorPoint, rightCensorPoint,
+        b_gradient, sigma,
+        regParam, elasticNetParam
+      )
+      b_gradient <- b_gradient - t(learningRate * result[[1]])
+    }
+    log_likelihood <- get_log_likelihood(b_gradient, sigma, test_record[folds[[i]],], ul, feature_names)
+    # print(log_likelihood)
+    if (log_likelihood > best_log_likelihood) {
+      best_log_likelihood <- log_likelihood
+      best_model <- result
+    }
+  }
+  # Return a matrix of performance
+  # return (b, sigma)
+  return (c(best_model, best_log_likelihood))
+}
+
+predict_tobit <- function(b, test_data) {
+  return (0)
+}
+```
+
+```{r }
+perf <- train_tobit(
+train_data, test_data,
+1,
+'label', c_name[c_name != 'first_appear'],
+0.5, 0.5, 100, 0.0003,
+left, right
+)
+
+perf
+```
+
+```{r k_folod_val, echo=FALSE}
+
+# Full features
+test_record <- train_data
+features <- c_name[c_name != 'first_appear']
+
+# Training
+fn <- as.formula(paste(label_name, paste(features, collapse = " + "), sep = " ~ "))
+
+
+best_model <- NULL
+best_log_likelihood <- -Inf
+folds <- createFolds(test_record[,1], k = k)
+for (i in 1:length(folds)) {
+  model <- AER::tobit(fn, left = left, right = right, dist = tobit_distribution, subset = NULL, data = test_record[-folds[[i]],])
+  log_likelihood <- get_log_likelihood(coef(model), model$scale, test_record[folds[[i]],], ul, features)
+  if (log_likelihood > best_log_likelihood) {
+    best_log_likelihood <- log_likelihood
+    best_model <- model
+  }
+}
+
+plot_performance(best_model, test_data, features)
+
+```
+
+
+
+```{r}
+
+
+
+
+```
